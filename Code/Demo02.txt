@@ -1,0 +1,2 @@
+這個範例主要展示我自行製作的Tween程式工具
+請閱讀public void Example3(GameObject go)即可

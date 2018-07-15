@@ -1,0 +1,605 @@
+這個Demo主要展示我自己曾經撰寫過的工具內的部分程式碼
+這個工具能夠在Unity3d 的Inspector編輯程式指令並執行程式指令
+並且能夠執行協程
+編輯器的圖示可以參考路徑同層的 ObjectCommand.PNG
+其中第一行與第二行都是相同指令只是有可編輯與閱讀性提高的切換功能
+
+類別 CoroutineVisitor在路徑同層的CoroutineVisitor.cs
+
+namespace ELCScript.ProgramTool.Command
+{
+	[ExecuteInEditMode]
+	public class ObjectCommand : MonoBehaviour, IAnotherNameComponent, ISerializationCallbackReceiver, ICommandProgram
+	{
+		...
+		
+		
+		class CoroutineInfo
+		{
+			public IEnumerator Coroutine;
+			public bool Paused = false;
+		}
+
+		public void StopRunningCoroutine(string name)
+		{
+			if(name!=null&& m_Coroutines!=null)
+			{
+				CoroutineInfo info;
+				if (m_Coroutines.TryGetValue(name,out info))
+				{
+					StopCoroutine(info.Coroutine);
+					m_Coroutines.Remove(name);
+				}
+			}
+		}
+		public void PauseRunningCoroutine(string name)
+		{
+			if (name != null && m_Coroutines != null)
+			{
+				CoroutineInfo info;
+				if (m_Coroutines.TryGetValue(name,out info))
+				{
+					StopCoroutine(info.Coroutine);
+					info.Paused = true;
+				}
+			}
+		}
+		public void ResumeRunningCoroutine(string name)
+		{
+			if (name != null && m_Coroutines != null)
+			{
+				CoroutineInfo info;
+				if (m_Coroutines.TryGetValue(name, out info))
+				{
+					if (info.Paused)
+					{
+						StartCoroutine(info.Coroutine);
+						info.Paused = true;
+					}
+				}
+			}
+		}
+		public bool IsCoroutineRunning(string name)
+		{
+			if (name != null && m_Coroutines != null)
+			{
+				CoroutineInfo info;
+				if (m_Coroutines.TryGetValue(name, out info))
+					return !info.Paused;
+				return false;
+			}
+			return false;
+		}
+		public bool IsCoroutineAlive(string name)
+		{
+			if (name != null && m_Coroutines != null)
+				return m_Coroutines.ContainsKey(name);
+			return false;
+		}
+		Dictionary<string, CoroutineInfo> m_Coroutines;
+		public void RunAsCoroutine(string name)
+		{
+			if (name == null)
+				return;
+			if (m_Coroutines == null)
+				m_Coroutines = new Dictionary<string, CoroutineInfo>();
+			CoroutineInfo info;
+			if (m_Coroutines.TryGetValue(name, out info))
+			{
+				StopCoroutine(info.Coroutine);
+				info.Paused = false;
+				info.Coroutine = AsCoroutine(name);
+			}
+			else
+			{
+				info = new CoroutineInfo() { Coroutine = AsCoroutine(name) };
+				m_Coroutines.Add(name, info);
+			}
+			
+			StartCoroutine(info.Coroutine);
+		}
+
+		//在編輯器狀態中，需要擷類型為取YieldInstruction或CustomYieldInstruction的指令來讓編輯器產生更新畫面的動作
+		//故使用CoroutineVisitor來對巢狀Coroutine進行深度拜訪並在為YieldInstruction的時候去更新編輯器
+		IEnumerator AsCoroutine(string name)
+		{
+			m_leaving = false;
+			if (Root.ValidChecked && Root.IsValid)
+			{
+				//使用CoroutineVisitor來過濾不是YieldInstruction的yield return value
+				CoroutineVisitor visitor = new CoroutineVisitor();
+				visitor.Start(Root.AsCoroutine());
+
+				for (;;)
+				{
+					bool b= visitor.MoveNext();
+					if (!b)
+					{
+						if (m_Coroutines != null && name != null)
+						{
+							if (m_Coroutines.ContainsKey(name))
+								m_Coroutines.Remove(name);
+						}
+						yield break;
+					}
+					object o = visitor.Current;
+					
+					YieldInstruction yi = o as YieldInstruction;
+					if (yi != null)
+					{
+#if UNITY_EDITOR
+						if (CheckEditor && EditorApplication.isPlaying && this.Editor != null)
+							this.Editor.Repaint();
+#endif
+						yield return yi;
+					}
+					CustomYieldInstruction cyi = o as CustomYieldInstruction;
+					if(cyi!=null)
+					{
+#if UNITY_EDITOR
+						if (CheckEditor && EditorApplication.isPlaying && this.Editor != null)
+							this.Editor.Repaint();
+#endif
+						yield return cyi;
+					}
+
+				}
+			}
+		}
+		
+		...
+	}
+	
+	....
+	
+	//這是其中的一種指令節點，在public override IEnumerator AsCoroutine() 當中可以看到其中的子節點也有return AsCoroutine()
+	//即為巢狀的Coroutine結構。
+	//至於其中的public override void Invoke()與public override object AsFunction()  程式碼幾乎一樣的緣故是為了執行上的速度所以做了複本
+	//在之後的修改上必須三種一併更新
+	#region OperationNode
+	public class OperationNode : StatementNode
+	{
+		public OperationNode(ICommandProgram program) : base(program)
+		{
+		}
+
+		static bool notBoolCond(OperationType lastOp)
+		{
+			return lastOp == OperationType.ForEach ||
+					   lastOp == OperationType.Switch || lastOp == OperationType.Enumerator;
+		}
+		public OperationNode Default(OperationType operation)
+		{
+			OperationType lastOp = operation;
+			this.operation = operation;
+			switch (operation)
+			{
+				default:
+					return this;
+				case OperationType.If:
+				case OperationType.WhileLoop:
+				case OperationType.DoWhile:
+					if (Condition == null || notBoolCond(lastOp))
+						Condition = new DataNode(program).Default(DataType.Boolean);
+					if (Actions == null || notBoolCond(lastOp))
+						Actions = new ActionNode(program).Default();
+					break;
+				case OperationType.ForEach:
+				case OperationType.Enumerator:
+					Condition = new MethodNode(program).Default();
+					Actions = new ActionNode(program).Default();
+					break;
+				case OperationType.IfElse:
+					if (Condition == null || notBoolCond(lastOp))
+						Condition = new DataNode(program).Default(DataType.Boolean);
+					if (Actions == null || notBoolCond(lastOp))
+						Actions = new ActionNode(program).Default();
+					ElseActions = new ActionNode(program).Default();
+					break;
+				case OperationType.Switch:
+					Condition = new MethodNode(program).Default();
+					SwitchItems.Clear();
+					break;
+			}
+			Construct();
+			return this;
+		}
+
+
+		private OperationType operation;
+		public OperationType Operation
+		{
+			get { return operation; }
+			set
+			{
+				if (operation != value || !constructed)
+				{
+					operation = value;
+					Construct();
+				}
+			}
+		}
+
+
+		public CommandNode Condition;
+		public bool ShowClearly;
+
+		public StatementNode Actions;
+		public StatementNode ElseActions;
+		public Dictionary<string, StatementNode> SwitchItems = new Dictionary<string, StatementNode>();
+		public string ForeachItemName;
+#if UNITY_EDITOR
+		public string EditorKey;
+#endif
+
+		public override void Invoke()
+		{
+			switch (Operation)
+			{
+				case OperationType.If:
+					if ((bool)Condition.Invoke())
+						Actions.Invoke();
+					break;
+				case OperationType.IfElse:
+					if ((bool)Condition.Invoke())
+						Actions.Invoke();
+					else
+						ElseActions.Invoke();
+					break;
+				case OperationType.WhileLoop:
+					while ((bool)Condition.Invoke() && !program.LeavingOrBreaking)
+					{
+						Actions.Invoke();
+						if (program.IsContinuing)
+							program.ResumeContinue();
+					}
+					if (program.IsBreaking)
+						program.ResumeBreak();
+					break;
+				case OperationType.DoWhile:
+					do
+					{
+						Actions.Invoke();
+						if (program.IsContinuing)
+							program.ResumeContinue();
+					}
+					while ((bool)Condition.Invoke() && !program.LeavingOrBreaking);
+					if (program.IsBreaking)
+						program.ResumeBreak();
+					break;
+				case OperationType.Switch:
+					StatementNode st;
+					if (SwitchItems.TryGetValue((string)Condition.Invoke(), out st))
+						st.Invoke();
+					else
+					{
+						if (SwitchItems.TryGetValue("default", out st))
+							st.Invoke();
+					}
+					break;
+				case OperationType.ForEach:
+					{
+						//在執行的component設定item給該component使其可以取得item
+						IEnumerable it = (IEnumerable)Condition.Invoke();
+						foreach (object item in it)
+						{
+							program.PushLocal(ForeachItemName, item);
+							Actions.Invoke();
+							program.PopLocal(ForeachItemName);
+							if (program.IsContinuing)
+								program.ResumeContinue();
+							if (program.LeavingOrBreaking)
+								break;
+						}
+						if (program.IsBreaking)
+							program.ResumeBreak();
+						break;
+					}
+				case OperationType.Enumerator:
+					{
+						
+						//在執行的component設定item給該component使其可以取得item
+						IEnumerator it = (IEnumerator)Condition.Invoke();
+						while (it.MoveNext())
+						{
+							program.PushLocal(ForeachItemName, it.Current);
+							Actions.Invoke();
+							program.PopLocal(ForeachItemName);
+							if (program.IsContinuing)
+								program.ResumeContinue();
+							if (program.LeavingOrBreaking)
+								break;
+						}
+						if (program.IsBreaking)
+							program.ResumeBreak();
+						break;
+					}
+			}
+		}
+
+		public override IEnumerator AsCoroutine()
+		{
+			switch (Operation)
+			{
+				case OperationType.If:
+					if ((bool)Condition.Invoke())
+						yield return Actions.AsCoroutine();
+					break;
+				case OperationType.IfElse:
+					if ((bool)Condition.Invoke())
+						yield return Actions.AsCoroutine();
+					else
+						yield return ElseActions.AsCoroutine();
+					break;
+				case OperationType.WhileLoop:
+					while ((bool)Condition.Invoke() && !program.LeavingOrBreaking)
+					{
+						yield return Actions.AsCoroutine();
+						if (program.IsContinuing)
+							program.ResumeContinue();
+					}
+					if (program.IsBreaking)
+						program.ResumeBreak();
+					break;
+				case OperationType.DoWhile:
+					do
+					{
+						yield return Actions.AsCoroutine();
+						if (program.IsContinuing)
+							program.ResumeContinue();
+					}
+					while ((bool)Condition.Invoke() && !program.LeavingOrBreaking);
+					if (program.IsBreaking)
+						program.ResumeBreak();
+					break;
+				case OperationType.Switch:
+					StatementNode st;
+					if (SwitchItems.TryGetValue((string)Condition.Invoke(), out st))
+						yield return st.AsCoroutine();
+					else
+					{
+						if (SwitchItems.TryGetValue("default", out st))
+							yield return st.AsCoroutine();
+					}
+					break;
+				case OperationType.ForEach:
+					{
+						//在執行的component設定item給該component使其可以取得item
+						IEnumerable it = (IEnumerable)Condition.Invoke();
+						foreach (object item in it)
+						{
+							program.PushLocal(ForeachItemName, item);
+							yield return Actions.AsCoroutine();
+							program.PopLocal(ForeachItemName);
+							if (program.IsContinuing)
+								program.ResumeContinue();
+							if (program.LeavingOrBreaking)
+								break;
+						}
+						if (program.IsBreaking)
+							program.ResumeBreak();
+						break;
+					}
+				case OperationType.Enumerator:
+					{
+						//在執行的component設定item給該component使其可以取得item
+						IEnumerator it = (IEnumerator)Condition.Invoke();
+						while (it.MoveNext())
+						{
+							program.PushLocal(ForeachItemName, it.Current);
+							yield return Actions.AsCoroutine();
+							program.PopLocal(ForeachItemName);
+							if (program.IsContinuing)
+								program.ResumeContinue();
+							if (program.LeavingOrBreaking)
+								break;
+						}
+						if (program.IsBreaking)
+							program.ResumeBreak();
+						break;
+					}
+			}
+		}
+
+		public override object AsFunction()
+		{
+			object o = null;
+			switch (Operation)
+			{
+				case OperationType.If:
+					if ((bool)Condition.Invoke())
+						o = Actions.AsFunction();
+					break;
+				case OperationType.IfElse:
+					if ((bool)Condition.Invoke())
+						o = Actions.AsFunction();
+					else
+						o = ElseActions.AsFunction();
+					break;
+				case OperationType.WhileLoop:
+					while ((bool)Condition.Invoke() && !program.LeavingOrBreaking)
+					{
+						o = Actions.AsFunction();
+						if (program.IsContinuing)
+							program.ResumeContinue();
+					}
+					if (program.IsBreaking)
+						program.ResumeBreak();
+					break;
+				case OperationType.DoWhile:
+					do
+					{
+						o = Actions.AsFunction();
+						if (program.IsContinuing)
+							program.ResumeContinue();
+					}
+					while ((bool)Condition.Invoke() && !program.LeavingOrBreaking);
+					if (program.IsBreaking)
+						program.ResumeBreak();
+					break;
+				case OperationType.Switch:
+					StatementNode st;
+					if (SwitchItems.TryGetValue((string)Condition.Invoke(), out st))
+						o = st.AsFunction();
+					else
+					{
+						if (SwitchItems.TryGetValue("default", out st))
+							o = st.AsFunction();
+					}
+					break;
+				case OperationType.ForEach:
+					{
+						//在執行的component設定item給該component使其可以取得item
+						IEnumerable it = (IEnumerable)Condition.Invoke();
+						foreach (object item in it)
+						{
+							program.PushLocal(ForeachItemName, item);
+							o = Actions.AsFunction();
+							program.PopLocal(ForeachItemName);
+							if (program.IsContinuing)
+								program.ResumeContinue();
+							if (program.LeavingOrBreaking)
+								break;
+						}
+						if (program.IsBreaking)
+							program.ResumeBreak();
+						break;
+					}
+				case OperationType.Enumerator:
+					{
+						//在執行的component設定item給該component使其可以取得item
+						IEnumerator it = (IEnumerator)Condition.Invoke();
+						while(it.MoveNext())
+						{
+							program.PushLocal(ForeachItemName, it.Current);
+							o = Actions.AsFunction();
+							program.PopLocal(ForeachItemName);
+							if (program.IsContinuing)
+								program.ResumeContinue();
+							if (program.LeavingOrBreaking)
+								break;
+						}
+						if (program.IsBreaking)
+							program.ResumeBreak();
+						break;
+					}
+			}
+			return o;
+		}
+
+		public override void Validate()
+		{
+			base.Validate();
+			if (constructed && !validChecked)
+			{
+				bool success = true;
+				switch (Operation)
+				{
+					case OperationType.If:
+					case OperationType.IfElse:
+					case OperationType.WhileLoop:
+					case OperationType.DoWhile:
+						if (Condition.ReturnType != typeof(bool))
+							success = false;
+						break;
+					case OperationType.Switch:
+						if (Condition.ReturnType != typeof(string))
+							success = false;
+						break;
+					case OperationType.ForEach:
+						if (!typeof(IEnumerable).IsAssignableFrom(Condition.ReturnType))
+							success = false;
+						break;
+					case OperationType.Enumerator:
+						if (!typeof(IEnumerator).IsAssignableFrom(Condition.ReturnType))
+							success = false;
+						break;
+				}
+
+				if (!success)
+				{
+					valid = false;
+				}
+				else
+					valid = true;
+
+				validChecked = true;
+			}
+		}
+
+		public override IEnumerable<BaseNode> Children
+		{
+			get
+			{
+				switch (Operation)
+				{
+					default:
+						yield break;
+					case OperationType.If:
+					case OperationType.WhileLoop:
+					case OperationType.DoWhile:
+					case OperationType.ForEach:
+					case OperationType.Enumerator:
+						yield return Condition;
+						yield return Actions;
+						break;
+					case OperationType.IfElse:
+						yield return Condition;
+						yield return Actions;
+						yield return ElseActions;
+						break;
+					case OperationType.Switch:
+						yield return Condition;
+						foreach (var val in SwitchItems.Values)
+							yield return val;
+						break;
+				}
+			}
+		}
+
+		public override void Construct()
+		{
+			constructed = true;
+		}
+
+		public override StatementType NodeType
+		{
+			get
+			{
+				return StatementType.Operation;
+			}
+		}
+
+		public override StatementNode Clone()
+		{
+			var rlt = new OperationNode(this.program);
+#if UNITY_EDITOR
+			rlt.Comment = this.Comment;
+#endif
+			rlt.constructed = true;
+			rlt.validChecked = false;
+			rlt.ShowClearly = ShowClearly;
+
+			rlt.operation = operation;
+			rlt.Condition = Condition.Clone();
+			if (Actions != null)
+				rlt.Actions = Actions.Clone();
+			if (ElseActions != null && operation == OperationType.IfElse)
+				rlt.ElseActions = ElseActions.Clone();
+			if (operation == OperationType.Switch)
+				foreach (var pair in SwitchItems)
+					rlt.SwitchItems.Add(pair.Key, pair.Value);
+			if (operation == OperationType.ForEach || operation == OperationType.Enumerator)
+				rlt.ForeachItemName = ForeachItemName;
+
+			return rlt;
+		}
+
+	}
+	#endregion
+	
+	....
+}
+	
+	
+
